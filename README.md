@@ -2,9 +2,9 @@
 
 ## Overview
 
-The main motivation was to create code that could communicate with the Wickedlaser LaserCube in the VVVVV visual programming environment. Therefore, the code is not accompanied by a specific application. In a nutshell, when you create a LaserCube object, you create two 'listeners' and one 'sender'. You set the IP address, set the buffer, and the sender starts sending. In theory that already should work. There are a number of specific fine-tuning settings that can be optionally set.
+The main motivation was to create code that could communicate with the [Wickedlaser LaserCube](https://www.laseros.com/lasercube/) in the [VVVV visual programming environment](https://visualprogramming.net/). Therefore, the code is not accompanied by a specific application. In a nutshell, when you create a LaserCube object, you create two 'listeners' and one 'sender'. You set the IP address, set the buffer, and the sender starts sending. In theory that already should work. There are a number of specific fine-tuning settings that can be optionally set.
 
-The code is probably not perfect, but the original C++ code is much more problematic because it is deeply tied to QT. There are implementations in Python, which inspired me to do this implementation in C#. My code has achieved a more granular setup that is suitable for fine-tuning and more complex configurations.
+The code is probably not perfect, but the [original C++ code](https://github.com/Wickedlasers/laserdocklib) is much more problematic because it is deeply tied to QT. There are [implementations in Python](https://gist.github.com/s4y/0675595c2ff5734e927d68caf652e3af), which inspired me to do this implementation in C#. My code has achieved a more granular setup that is suitable for fine-tuning and more complex configurations.
 
 Pseudocode (not tested, but should work):
 

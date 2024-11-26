@@ -12,7 +12,9 @@ Pseudocode (not tested, but should work):
 var laser = new LaserCube();
 laser.RemoteEndPoint = "192.168.1.42";
 
-// Be careful, the laser will not show anything if there is no RingBuffer running, there must be at least 2 chunks for this to work. This is probably done for safety reasons. Two chunks by default >150pts
+// Be careful, the laser will not show anything if there is no RingBuffer running,
+// there must be at least 2 chunks for this to work. This is probably done
+// for safety reasons. Two chunks by default >150pts
 var buffer = new List<LaserPoint>(256); //some points
 laser.SetPoints(buffer);
 

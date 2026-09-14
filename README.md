@@ -1,52 +1,59 @@
-### LASERS ARE DANGEROUS. USE WITH CAUTION. THE AUTHOR IS NOT RESPONSIBLE FOR ANY MISUSE OF THIS CODE. IF YOU USE A LASER, YOU ACKNOWLEDGE THAT YOU ARE AWARE OF ALL PRECAUTIONS.
+# LaserCubeSharp
 
-## Overview
+Minimal .NET 8 library for controlling a network LaserCube over UDP.
 
-The main motivation was to create code that could communicate with the [Wickedlaser LaserCube](https://www.laseros.com/lasercube/) in the [VVVV visual programming environment](https://visualprogramming.net/). Therefore, the code is not accompanied by a specific application. In a nutshell, when you create a LaserCube object, you create two 'listeners' and one 'sender'. You set the IP address, set the buffer, and the sender starts sending. In theory that already should work. There are a number of specific fine-tuning settings that can be optionally set.
+> Lasers are dangerous. Use suitable safety equipment and a controlled environment.
+> Output is never enabled automatically by this library.
 
-The code is probably not perfect, but the [original C++ code](https://github.com/Wickedlasers/laserdocklib) is much more problematic because it is deeply tied to QT. There are [implementations in Python](https://gist.github.com/s4y/0675595c2ff5734e927d68caf652e3af), which inspired me to do this implementation in C#. My code has achieved a more granular setup that is suitable for fine-tuning and more complex configurations.
+## Usage
 
-Pseudocode (not tested, but should work):
+```csharp
+using LaserCubeSharp;
 
-```C#
-var laser = new LaserCube();
-laser.RemoteEndPoint = "192.168.1.42";
+await using var laser = new LaserCube("192.168.1.42");
+await laser.StartAsync();
 
-// Be careful, the laser will not show anything if there is no RingBuffer running,
-// there must be at least 2 chunks for this to work. This is probably done
-// for safety reasons. Two chunks by default >150pts
-var buffer = new List<LaserPoint>(256); //some points
-laser.SetPoints(buffer);
+await laser.SetDacRateAsync(30_000);
+await laser.SetOutputEnabledAsync(true);
 
-// Optionals:
-laser.SetDACRate(30000).Wait(); 
-laser.RequestConfiguration().Wait();
-laser.SendDisableOutput().Wait();
-laser.SendEnableOutput().Wait();
-laser.ChunkSize = 146;
-laser.FreeBufferLimit = 1000;
-laser.SetDelayPacket(1000);
-laser.SetDelayMessage(0);
+// A deliberately blank two-packet frame. Replace it with a safely prepared scan.
+var frame = Enumerable
+    .Repeat(new LaserPoint(2048, 2048, 0, 0, 0), 280)
+    .ToArray();
 
-// Device Status Gathered from Bytes from Device
-LaserConfiguration laserStatus = laser.GetConfigData();
-Console.WriteLine(laserStatus.ToString());
+if (!await laser.SendFrameAsync(frame))
+{
+    // The device did not report enough free buffer space. Retry later.
+}
+
+await laser.SetOutputEnabledAsync(false);
 ```
 
-## How it works
+`StartAsync` opens one bidirectional command socket on UDP port `45457` and one
+bidirectional data socket on `45458`. It disables output, clears stale samples,
+enables buffer feedback, and requests device status.
 
-The main algorithm for the transmission is as follows:
+One `SendFrameAsync` call submits the supplied frame at most once. It returns `false`
+instead of sending when the latest buffer estimate cannot safely accept the whole
+frame. A frame is limited to 2800 points: 20 packets of at most 140 points each.
 
-1. the point buffer must be chunked. If you exceed your network's MTU by one chunk, the network will drop those packets. 146 points per chunk fits into the standard 1500 bytes per packet. But in general, if you experiment with chunk sizes enough, you'll find that reducing the size can also be useful.
+`StopAsync` and disposal attempt to disable output before closing the sockets.
+Applications should still provide their own physical safety and emergency-stop
+procedure.
 
-2. Chunks are sent to the device with a delay between sends equal to 'PacketDelayMicroseconds'.
+## Device status
 
-3. If the buffer is smaller than the specified limit, the chunk is not sent, it is discarded.
+The latest validated 64-byte status response is available through `laser.Status`.
+`laser.EstimatedBufferFree` includes the library's local reservation of submitted
+points. Invalid, failed, truncated, and unknown-version responses are ignored.
 
-4. The cycle is repeated with the delay specified in 'MessageDelayMicroseconds', incrementing the frame number.
+## Protocol checks
 
-The algorithm for receiving information has two "listeners" because there are two ports to which the device can respond in a number of cases.
+The repository includes dependency-free checks for packet encoding and response
+parsing:
 
-1. First, the algorithm sends a request every 600 buffers sent. The request is for a "configuration" that is stored in the object when it is received. This is the data that contains all the configuration fields, including the free buffer.
+```powershell
+dotnet run --project LaserCubeSharp.ProtocolChecks -c Release
+```
 
-2. Second, the algorithm listens for bytes representing information about the current state of the ring buffer. These bytes carry data about the current free buffer that is received in response to sent point packets. This buffer sets the free buffer field to 'configuration'.
+These checks do not verify behavior against physical hardware.

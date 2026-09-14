@@ -120,12 +120,12 @@ public sealed class LaserCube : IDisposable, IAsyncDisposable
                 return;
             }
 
-            var newCommandClient = CreateClient(LaserCubeProtocol.CommandPort, commandEndPoint);
+            var newCommandClient = CreateClient(LaserCubeProtocol.CommandPort);
             UdpClient? newDataClient = null;
 
             try
             {
-                newDataClient = CreateClient(LaserCubeProtocol.DataPort, dataEndPoint);
+                newDataClient = CreateClient(LaserCubeProtocol.DataPort);
             }
             catch
             {
@@ -263,7 +263,7 @@ public sealed class LaserCube : IDisposable, IAsyncDisposable
                     messageSequence,
                     frameSequence);
 
-                var bytesSent = await client.SendAsync(packet, cancellationToken).ConfigureAwait(false);
+                var bytesSent = await client.SendAsync(packet, dataEndPoint, cancellationToken).ConfigureAwait(false);
                 if (bytesSent != packet.Length)
                 {
                     throw new IOException($"UDP socket accepted {bytesSent} of {packet.Length} bytes.");
@@ -327,7 +327,7 @@ public sealed class LaserCube : IDisposable, IAsyncDisposable
         GC.SuppressFinalize(this);
     }
 
-    private static UdpClient CreateClient(int localPort, IPEndPoint remoteEndPoint)
+    private static UdpClient CreateClient(int localPort)
     {
         var client = new UdpClient(AddressFamily.InterNetwork);
 
@@ -336,7 +336,6 @@ public sealed class LaserCube : IDisposable, IAsyncDisposable
             client.Client.ReceiveBufferSize = SocketBufferSize;
             client.Client.SendBufferSize = SocketBufferSize;
             client.Client.Bind(new IPEndPoint(IPAddress.Any, localPort));
-            client.Connect(remoteEndPoint);
             return client;
         }
         catch
@@ -365,7 +364,7 @@ public sealed class LaserCube : IDisposable, IAsyncDisposable
             var client = commandClient ?? throw new InvalidOperationException("LaserCube has not been started.");
             for (var repetition = 0; repetition < repeatCount; repetition++)
             {
-                var bytesSent = await client.SendAsync(command, cancellationToken).ConfigureAwait(false);
+                var bytesSent = await client.SendAsync(command, commandEndPoint, cancellationToken).ConfigureAwait(false);
                 if (bytesSent != command.Length)
                 {
                     throw new IOException($"UDP socket accepted {bytesSent} of {command.Length} bytes.");
@@ -385,6 +384,11 @@ public sealed class LaserCube : IDisposable, IAsyncDisposable
             while (!cancellationToken.IsCancellationRequested)
             {
                 var response = await client.ReceiveAsync(cancellationToken).ConfigureAwait(false);
+                if (!response.RemoteEndPoint.Address.Equals(deviceAddress))
+                {
+                    continue;
+                }
+
                 ProcessResponse(response.Buffer);
             }
         }

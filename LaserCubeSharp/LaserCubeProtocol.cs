@@ -6,6 +6,7 @@ namespace LaserCubeSharp;
 
 internal static class LaserCubeProtocol
 {
+    internal const int AlivePort = 45456;
     internal const int CommandPort = 45457;
     internal const int DataPort = 45458;
     internal const int FullInfoResponseLength = 64;
@@ -15,6 +16,7 @@ internal static class LaserCubeProtocol
     internal const int MaximumPointsPerPacket = 140;
     internal const int MaximumPacketsPerBurst = 20;
 
+    internal const byte GetAlive = 0x27;
     internal const byte GetFullInfo = 0x77;
     internal const byte EnableBufferReplies = 0x78;
     internal const byte SetOutput = 0x80;
@@ -91,6 +93,11 @@ internal static class LaserCubeProtocol
         bufferFree = BinaryPrimitives.ReadUInt16LittleEndian(response[2..4]);
         return true;
     }
+
+    internal static bool IsAliveResponse(ReadOnlySpan<byte> response) =>
+        response.Length == 2 &&
+        response[0] == GetAlive &&
+        response[1] == 0;
 
     internal static bool TryParseStatus(ReadOnlySpan<byte> response, out LaserCubeStatus? status)
     {

@@ -68,3 +68,10 @@ public sealed record LaserCubeStatus(
     IPAddress Address,
     byte ModelNumber,
     string ModelName);
+
+public sealed record LaserCubeDevice(
+    IPAddress Address,
+    LaserCubeStatus Status)
+{
+    public LaserCube CreateClient() => new(Address);
+}

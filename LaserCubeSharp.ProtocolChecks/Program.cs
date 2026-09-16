@@ -11,6 +11,7 @@ var checks = new (string Name, Action Run)[]
     ("packet point limit", CheckPacketPointLimit),
     ("short frame stream packetization", CheckShortFrameStreamPacketization),
     ("data sender burst pacing", CheckDataSenderBurstPacing),
+    ("discovery protocol", CheckDiscoveryProtocol),
     ("buffer response parsing", CheckBufferResponseParsing),
     ("full status parsing", CheckStatusParsing),
     ("invalid status rejection", CheckInvalidStatusRejection),
@@ -223,6 +224,27 @@ static void CheckBufferResponseParsing()
 
     response[1] = 1;
     False(LaserCubeProtocol.TryParseBufferFree(response, out _));
+}
+
+static void CheckDiscoveryProtocol()
+{
+    Throws<ArgumentOutOfRangeException>(() =>
+        LaserCube.DiscoverAsync(TimeSpan.Zero).GetAwaiter().GetResult());
+
+    True(LaserCubeProtocol.IsAliveResponse(new byte[] { 0x27, 0x00 }));
+    False(LaserCubeProtocol.IsAliveResponse(new byte[] { 0x27 }));
+    False(LaserCubeProtocol.IsAliveResponse(new byte[] { 0x27, 0x01 }));
+
+    Equal(
+        IPAddress.Parse("192.168.7.255"),
+        LaserCubeDiscovery.GetBroadcastAddress(
+            IPAddress.Parse("192.168.7.42"),
+            IPAddress.Parse("255.255.255.0")));
+    Equal(
+        IPAddress.Parse("10.31.255.255"),
+        LaserCubeDiscovery.GetBroadcastAddress(
+            IPAddress.Parse("10.30.4.5"),
+            IPAddress.Parse("255.254.0.0")));
 }
 
 static void CheckStatusParsing()

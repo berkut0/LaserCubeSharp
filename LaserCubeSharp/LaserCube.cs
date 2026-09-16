@@ -49,6 +49,11 @@ public sealed class LaserCube : IDisposable, IAsyncDisposable
         dataEndPoint = new IPEndPoint(deviceAddress, LaserCubeProtocol.DataPort);
     }
 
+    public static Task<IReadOnlyList<LaserCubeDevice>> DiscoverAsync(
+        TimeSpan? timeout = null,
+        CancellationToken cancellationToken = default) =>
+        LaserCubeDiscovery.DiscoverAsync(timeout, cancellationToken);
+
     public IPAddress DeviceAddress => deviceAddress;
 
     public bool IsStarted

@@ -25,6 +25,7 @@ public sealed class LaserCube : IDisposable, IAsyncDisposable
     private Exception? lastTransportError;
     private int estimatedBufferFree;
     private int minimumBufferFree = 1000;
+    private byte messageSequence;
     private byte frameSequence;
     private bool isStarted;
     private bool isDisposed;
@@ -147,6 +148,7 @@ public sealed class LaserCube : IDisposable, IAsyncDisposable
                 isStarted = true;
             }
 
+            messageSequence = 0;
             frameSequence = 0;
 
             try
@@ -251,7 +253,6 @@ public sealed class LaserCube : IDisposable, IAsyncDisposable
 
             var client = dataClient ?? throw new InvalidOperationException("LaserCube has not been started.");
             var offset = 0;
-            byte messageSequence = 0;
 
             while (offset < points.Count)
             {

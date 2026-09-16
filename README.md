@@ -10,6 +10,7 @@ Minimal .NET 8 library for controlling a network LaserCube over UDP.
 ```csharp
 using LaserCubeSharp;
 
+// Discovery is optional: use a known address directly when it is configured.
 await using var laser = new LaserCube("192.168.1.42");
 await laser.StartAsync();
 
@@ -28,6 +29,57 @@ if (!await laser.SendFrameAsync(frame))
 
 await laser.SetOutputEnabledAsync(false);
 ```
+
+## Device discovery
+
+`DiscoverAsync` sends the original LaserCube alive (`0x27`) and full-info (`0x77`)
+requests through every suitable active non-loopback IPv4 network interface and
+listens for one second by default. Results are deduplicated by the source IP
+address. The timeout can be changed, for example with
+`LaserCube.DiscoverAsync(TimeSpan.FromSeconds(2))`.
+
+Each result contains the address from which the cube replied and its decoded
+status:
+
+```csharp
+using LaserCubeSharp;
+
+var devices = await LaserCube.DiscoverAsync(
+    timeout: TimeSpan.FromSeconds(2),
+    cancellationToken);
+
+foreach (var device in devices)
+{
+    Console.WriteLine(
+        $"{device.Status.ModelName} {device.Status.SerialNumber} at {device.Address}");
+}
+```
+
+An empty list means that no cube replied before the timeout. Discovery supports
+multiple cubes and multiple active network adapters. Broadcast traffic must be
+allowed by the operating system, firewall, access point, and VLAN configuration.
+
+```csharp
+var device = devices.FirstOrDefault()
+    ?? throw new InvalidOperationException("No LaserCube was found.");
+
+await using var laser = device.CreateClient();
+await laser.StartAsync();
+```
+
+Applications that need a specific cube can select it by `Address` or
+`Status.SerialNumber`.
+
+`LaserCubeDevice.Address` is the source address from which the response was
+received and is the address used by `CreateClient()`. `Status.Address` is the
+address reported by the device firmware and may be stale while the network is
+being reconfigured.
+
+Discovery is not required. Use `new LaserCube("192.168.1.42")` or
+`new LaserCube(IPAddress.Parse("192.168.1.42"))` whenever the application already
+knows the device address.
+
+## Connection and streaming
 
 `StartAsync` opens one bidirectional command socket on UDP port `45457` and one
 bidirectional data socket on `45458`. It disables output, clears stale samples,

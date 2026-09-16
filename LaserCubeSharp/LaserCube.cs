@@ -13,7 +13,6 @@ public sealed class LaserCube : IDisposable, IAsyncDisposable
     private readonly IPEndPoint dataEndPoint;
     private readonly SemaphoreSlim lifecycleGate = new(1, 1);
     private readonly SemaphoreSlim commandSendGate = new(1, 1);
-    private readonly SemaphoreSlim dataSendGate = new(1, 1);
     private readonly object stateGate = new();
 
     private UdpClient? commandClient;
@@ -21,12 +20,13 @@ public sealed class LaserCube : IDisposable, IAsyncDisposable
     private CancellationTokenSource? receiveCancellation;
     private Task? commandReceiveTask;
     private Task? dataReceiveTask;
+    private LaserCubeDataSender? dataSender;
     private LaserCubeStatus? status;
     private Exception? lastTransportError;
     private int estimatedBufferFree;
+    private int queuedSampleCount;
     private int minimumBufferFree = 1000;
-    private byte messageSequence;
-    private byte frameSequence;
+    private uint dacRate;
     private bool isStarted;
     private bool isDisposed;
 
@@ -137,19 +137,24 @@ public sealed class LaserCube : IDisposable, IAsyncDisposable
             commandClient = newCommandClient;
             dataClient = newDataClient;
             receiveCancellation = new CancellationTokenSource();
-            commandReceiveTask = ReceiveResponsesAsync(newCommandClient, receiveCancellation.Token);
-            dataReceiveTask = ReceiveResponsesAsync(newDataClient, receiveCancellation.Token);
+            commandReceiveTask = ReceiveResponsesAsync(newCommandClient, isDataSocket: false, receiveCancellation.Token);
+            dataReceiveTask = ReceiveResponsesAsync(newDataClient, isDataSocket: true, receiveCancellation.Token);
+            dataSender = new LaserCubeDataSender(
+                (packet, token) => SendDataPacketAsync(newDataClient, packet, token),
+                GetDacRate,
+                OnSamplesSent,
+                OnSamplesDropped,
+                RecordTransportError);
 
             lock (stateGate)
             {
                 status = null;
                 estimatedBufferFree = 0;
+                queuedSampleCount = 0;
+                dacRate = 0;
                 lastTransportError = null;
                 isStarted = true;
             }
-
-            messageSequence = 0;
-            frameSequence = 0;
 
             try
             {
@@ -190,13 +195,33 @@ public sealed class LaserCube : IDisposable, IAsyncDisposable
     {
         ThrowIfNotStarted();
         await SendCommandAsync(LaserCubeProtocol.CreateSetRateCommand(rate), cancellationToken).ConfigureAwait(false);
+
+        lock (stateGate)
+        {
+            dacRate = rate;
+        }
     }
 
     public async ValueTask SetOutputEnabledAsync(bool enabled, CancellationToken cancellationToken = default)
     {
         ThrowIfNotStarted();
-        await SendCommandAsync(
-            LaserCubeProtocol.CreateBooleanCommand(LaserCubeProtocol.SetOutput, enabled),
+        var command = LaserCubeProtocol.CreateBooleanCommand(LaserCubeProtocol.SetOutput, enabled);
+
+        if (enabled)
+        {
+            await SendCommandAsync(command, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
+        var sender = GetDataSender();
+        if (sender.Fault is not null)
+        {
+            await SendCommandAsync(command, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
+        await sender.ResetAsync(
+            token => SendCommandAsync(command, token),
             cancellationToken).ConfigureAwait(false);
     }
 
@@ -209,7 +234,23 @@ public sealed class LaserCube : IDisposable, IAsyncDisposable
     public async ValueTask ClearRingBufferAsync(CancellationToken cancellationToken = default)
     {
         ThrowIfNotStarted();
-        await SendCommandAsync(new byte[] { LaserCubeProtocol.ClearRingBuffer }, cancellationToken).ConfigureAwait(false);
+        var sender = GetDataSender();
+        var command = new byte[] { LaserCubeProtocol.ClearRingBuffer };
+        if (sender.Fault is not null)
+        {
+            await SendCommandAsync(command, cancellationToken).ConfigureAwait(false);
+        }
+        else
+        {
+            await sender.ResetAsync(
+                token => SendCommandAsync(command, token),
+                cancellationToken).ConfigureAwait(false);
+        }
+
+        lock (stateGate)
+        {
+            estimatedBufferFree = 0;
+        }
     }
 
     public async ValueTask<bool> SendFrameAsync(
@@ -218,76 +259,70 @@ public sealed class LaserCube : IDisposable, IAsyncDisposable
     {
         ArgumentNullException.ThrowIfNull(points);
         ThrowIfNotStarted();
+        cancellationToken.ThrowIfCancellationRequested();
 
         if (points.Count == 0)
         {
             return true;
         }
 
-        if (points.Count > LaserCubeProtocol.MaximumPointsPerFrame)
+        var sampleCount = points.Count;
+        LaserCubeDataSender? sender;
+        lock (stateGate)
         {
-            throw new ArgumentException(
-                $"A frame cannot exceed {LaserCubeProtocol.MaximumPointsPerFrame} points.",
-                nameof(points));
+            sender = dataSender;
+            if (!isStarted || sender is null)
+            {
+                throw new InvalidOperationException("Call StartAsync before communicating with the LaserCube.");
+            }
+
+            if (sender.Fault is not null)
+            {
+                throw new InvalidOperationException("The LaserCube data sender has stopped after a transport error.", sender.Fault);
+            }
+
+            if (estimatedBufferFree - sampleCount >= minimumBufferFree)
+            {
+                estimatedBufferFree -= sampleCount;
+                queuedSampleCount += sampleCount;
+            }
+            else
+            {
+                sender = null;
+            }
         }
 
-        await dataSendGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        if (sender is null)
+        {
+            await RequestBufferFreeAsync(cancellationToken).ConfigureAwait(false);
+            return false;
+        }
 
+        LaserPoint[] samples;
         try
         {
-            var reserved = false;
-            lock (stateGate)
+            samples = new LaserPoint[sampleCount];
+            for (var index = 0; index < sampleCount; index++)
             {
-                if (estimatedBufferFree - points.Count >= minimumBufferFree)
-                {
-                    estimatedBufferFree -= points.Count;
-                    reserved = true;
-                }
+                samples[index] = points[index];
             }
 
-            if (!reserved)
-            {
-                await RequestBufferFreeAsync(cancellationToken).ConfigureAwait(false);
-                return false;
-            }
+            cancellationToken.ThrowIfCancellationRequested();
+        }
+        catch
+        {
+            ReleaseQueuedReservation(sampleCount);
+            throw;
+        }
 
-            var client = dataClient ?? throw new InvalidOperationException("LaserCube has not been started.");
-            var offset = 0;
-
-            while (offset < points.Count)
-            {
-                var count = Math.Min(LaserCubeProtocol.MaximumPointsPerPacket, points.Count - offset);
-                var packet = LaserCubeProtocol.CreateDataPacket(
-                    points,
-                    offset,
-                    count,
-                    messageSequence,
-                    frameSequence);
-
-                var bytesSent = await client.SendAsync(packet, dataEndPoint, cancellationToken).ConfigureAwait(false);
-                if (bytesSent != packet.Length)
-                {
-                    throw new IOException($"UDP socket accepted {bytesSent} of {packet.Length} bytes.");
-                }
-
-                offset += count;
-                unchecked
-                {
-                    messageSequence++;
-                }
-            }
-
-            unchecked
-            {
-                frameSequence++;
-            }
-
+        if (sender.TryEnqueue(samples))
+        {
             return true;
         }
-        finally
-        {
-            dataSendGate.Release();
-        }
+
+        ReleaseQueuedReservation(sampleCount);
+
+        throw new InvalidOperationException("The LaserCube data sender is no longer accepting samples.", sender.Fault);
     }
 
     public async ValueTask StopAsync()
@@ -378,7 +413,10 @@ public sealed class LaserCube : IDisposable, IAsyncDisposable
         }
     }
 
-    private async Task ReceiveResponsesAsync(UdpClient client, CancellationToken cancellationToken)
+    private async Task ReceiveResponsesAsync(
+        UdpClient client,
+        bool isDataSocket,
+        CancellationToken cancellationToken)
     {
         try
         {
@@ -390,7 +428,7 @@ public sealed class LaserCube : IDisposable, IAsyncDisposable
                     continue;
                 }
 
-                ProcessResponse(response.Buffer);
+                ProcessResponse(response.Buffer, isDataSocket);
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -405,14 +443,15 @@ public sealed class LaserCube : IDisposable, IAsyncDisposable
         }
     }
 
-    private void ProcessResponse(ReadOnlySpan<byte> response)
+    private void ProcessResponse(ReadOnlySpan<byte> response, bool isDataSocket)
     {
         if (LaserCubeProtocol.TryParseStatus(response, out var parsedStatus))
         {
             lock (stateGate)
             {
                 status = parsedStatus;
-                estimatedBufferFree = parsedStatus!.ReceiveBufferFree;
+                dacRate = parsedStatus!.DacRate;
+                estimatedBufferFree = Math.Max(0, parsedStatus.ReceiveBufferFree - queuedSampleCount);
             }
 
             return;
@@ -420,74 +459,137 @@ public sealed class LaserCube : IDisposable, IAsyncDisposable
 
         if (LaserCubeProtocol.TryParseBufferFree(response, out var bufferFree))
         {
+            LaserCubeDataSender? sender;
             lock (stateGate)
             {
-                estimatedBufferFree = bufferFree;
+                estimatedBufferFree = Math.Max(0, bufferFree - queuedSampleCount);
                 if (status is not null)
                 {
                     status = status with { ReceiveBufferFree = bufferFree };
                 }
+
+                sender = dataSender;
+            }
+
+            if (isDataSocket)
+            {
+                sender?.ReportDataFeedback();
             }
         }
     }
 
     private async ValueTask StopCoreAsync()
     {
-        if (!isStarted)
+        LaserCubeDataSender? sender;
+        lock (stateGate)
         {
-            return;
+            if (!isStarted)
+            {
+                return;
+            }
+
+            isStarted = false;
+            sender = dataSender;
+            dataSender = null;
+            estimatedBufferFree = 0;
+            queuedSampleCount = 0;
         }
 
-        await dataSendGate.WaitAsync().ConfigureAwait(false);
+        if (sender is not null)
+        {
+            await sender.DisposeAsync().ConfigureAwait(false);
+        }
+
+        using var shutdownTimeout = new CancellationTokenSource(TimeSpan.FromMilliseconds(500));
 
         try
         {
-            using var shutdownTimeout = new CancellationTokenSource(TimeSpan.FromMilliseconds(500));
-
-            try
-            {
-                await SendCommandAsync(
-                    LaserCubeProtocol.CreateBooleanCommand(LaserCubeProtocol.SetOutput, false),
-                    shutdownTimeout.Token).ConfigureAwait(false);
-                await SendCommandAsync(
-                    new byte[] { LaserCubeProtocol.ClearRingBuffer },
-                    shutdownTimeout.Token).ConfigureAwait(false);
-                await SetBufferRepliesEnabledCoreAsync(false, shutdownTimeout.Token).ConfigureAwait(false);
-            }
-            catch (Exception exception) when (exception is OperationCanceledException or SocketException or ObjectDisposedException)
-            {
-                RecordTransportError(exception);
-            }
-
-            var cancellation = receiveCancellation;
-            var commandTask = commandReceiveTask;
-            var dataTask = dataReceiveTask;
-
-            cancellation?.Cancel();
-            commandClient?.Dispose();
-            dataClient?.Dispose();
-
-            if (commandTask is not null && dataTask is not null)
-            {
-                await Task.WhenAll(commandTask, dataTask).ConfigureAwait(false);
-            }
-
-            cancellation?.Dispose();
-            receiveCancellation = null;
-            commandReceiveTask = null;
-            dataReceiveTask = null;
-            commandClient = null;
-            dataClient = null;
-
-            lock (stateGate)
-            {
-                isStarted = false;
-                estimatedBufferFree = 0;
-            }
+            await SendCommandAsync(
+                LaserCubeProtocol.CreateBooleanCommand(LaserCubeProtocol.SetOutput, false),
+                shutdownTimeout.Token).ConfigureAwait(false);
+            await SendCommandAsync(
+                new byte[] { LaserCubeProtocol.ClearRingBuffer },
+                shutdownTimeout.Token).ConfigureAwait(false);
+            await SetBufferRepliesEnabledCoreAsync(false, shutdownTimeout.Token).ConfigureAwait(false);
         }
-        finally
+        catch (Exception exception) when (exception is OperationCanceledException or SocketException or ObjectDisposedException)
         {
-            dataSendGate.Release();
+            RecordTransportError(exception);
+        }
+
+        var cancellation = receiveCancellation;
+        var commandTask = commandReceiveTask;
+        var dataTask = dataReceiveTask;
+
+        cancellation?.Cancel();
+        commandClient?.Dispose();
+        dataClient?.Dispose();
+
+        if (commandTask is not null && dataTask is not null)
+        {
+            await Task.WhenAll(commandTask, dataTask).ConfigureAwait(false);
+        }
+
+        cancellation?.Dispose();
+        receiveCancellation = null;
+        commandReceiveTask = null;
+        dataReceiveTask = null;
+        commandClient = null;
+        dataClient = null;
+
+        lock (stateGate)
+        {
+            estimatedBufferFree = 0;
+            queuedSampleCount = 0;
+        }
+    }
+
+    private async ValueTask SendDataPacketAsync(
+        UdpClient client,
+        ReadOnlyMemory<byte> packet,
+        CancellationToken cancellationToken)
+    {
+        var bytesSent = await client.SendAsync(packet, dataEndPoint, cancellationToken).ConfigureAwait(false);
+        if (bytesSent != packet.Length)
+        {
+            throw new IOException($"UDP socket accepted {bytesSent} of {packet.Length} bytes.");
+        }
+    }
+
+    private uint GetDacRate()
+    {
+        lock (stateGate)
+        {
+            return dacRate;
+        }
+    }
+
+    private LaserCubeDataSender GetDataSender()
+    {
+        lock (stateGate)
+        {
+            return dataSender ?? throw new InvalidOperationException("Call StartAsync before communicating with the LaserCube.");
+        }
+    }
+
+    private void OnSamplesSent(int count)
+    {
+        lock (stateGate)
+        {
+            queuedSampleCount = Math.Max(0, queuedSampleCount - count);
+        }
+    }
+
+    private void OnSamplesDropped(int count) => ReleaseQueuedReservation(count);
+
+    private void ReleaseQueuedReservation(int count)
+    {
+        lock (stateGate)
+        {
+            queuedSampleCount = Math.Max(0, queuedSampleCount - count);
+            estimatedBufferFree = isStarted
+                ? Math.Min(ushort.MaxValue, estimatedBufferFree + count)
+                : 0;
         }
     }
 
@@ -522,6 +624,5 @@ public sealed class LaserCube : IDisposable, IAsyncDisposable
         isDisposed = true;
         lifecycleGate.Dispose();
         commandSendGate.Dispose();
-        dataSendGate.Dispose();
     }
 }

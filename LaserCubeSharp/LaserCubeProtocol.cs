@@ -13,8 +13,7 @@ internal static class LaserCubeProtocol
     internal const int PointSize = 10;
     internal const int DataHeaderSize = 4;
     internal const int MaximumPointsPerPacket = 140;
-    internal const int MaximumPacketsPerFrame = 20;
-    internal const int MaximumPointsPerFrame = MaximumPointsPerPacket * MaximumPacketsPerFrame;
+    internal const int MaximumPacketsPerBurst = 20;
 
     internal const byte GetFullInfo = 0x77;
     internal const byte EnableBufferReplies = 0x78;

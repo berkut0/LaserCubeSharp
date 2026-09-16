@@ -33,9 +33,18 @@ await laser.SetOutputEnabledAsync(false);
 bidirectional data socket on `45458`. It disables output, clears stale samples,
 enables buffer feedback, and requests device status.
 
-One `SendFrameAsync` call submits the supplied frame at most once. It returns `false`
-instead of sending when the latest buffer estimate cannot safely accept the whole
-frame. A frame is limited to 2800 points: 20 packets of at most 140 points each.
+`SendFrameAsync` atomically accepts the supplied samples into a session-local queue.
+It returns `false` without accepting any samples when the latest buffer estimate
+cannot safely accept the whole set. Accepted samples are copied, retain their exact
+order and values, and are packetized independently of call boundaries.
+
+The sender combines consecutive short sets into packets of up to 140 samples. A
+partial packet waits for at most the playback duration of one full packet, clamped
+to 1-10 ms. Transport bursts contain at most 20 packets. Buffer replies allow the
+next burst to proceed as soon as the device has processed the previous one; a 10 ms
+recovery timeout is used when replies are unavailable. `message_number` advances
+per packet, while `frame_number` identifies a transport burst rather than a
+`SendFrameAsync` call.
 
 `StopAsync` and disposal attempt to disable output before closing the sockets.
 Applications should still provide their own physical safety and emergency-stop

@@ -9,6 +9,8 @@ var checks = new (string Name, Action Run)[]
     ("command encoding", CheckCommandEncoding),
     ("data packet encoding", CheckDataPacketEncoding),
     ("packet point limit", CheckPacketPointLimit),
+    ("short frame stream packetization", CheckShortFrameStreamPacketization),
+    ("data sender burst pacing", CheckDataSenderBurstPacing),
     ("buffer response parsing", CheckBufferResponseParsing),
     ("full status parsing", CheckStatusParsing),
     ("invalid status rejection", CheckInvalidStatusRejection),
@@ -77,6 +79,140 @@ static void CheckPacketPointLimit()
     var tooMany = Enumerable.Repeat(new LaserPoint(0, 0, 0, 0, 0), 141).ToArray();
     Throws<ArgumentOutOfRangeException>(() =>
         LaserCubeProtocol.CreateDataPacket(tooMany, 0, tooMany.Length, 0, 0));
+}
+
+static void CheckShortFrameStreamPacketization()
+{
+    foreach (var frameSize in new[] { 3, 30, 70, 120 })
+    {
+        CheckShortFrameSize(frameSize);
+    }
+}
+
+static void CheckShortFrameSize(int frameSize)
+{
+    const int targetPacketCount = 260;
+    var sampleTotal = (targetPacketCount * LaserCubeProtocol.MaximumPointsPerPacket) + 17;
+    var repetitions = (sampleTotal + frameSize - 1) / frameSize;
+    var expected = new List<LaserPoint>(repetitions * frameSize);
+    var queue = new LaserCubePacketQueue();
+
+    for (var repetition = 0; repetition < repetitions; repetition++)
+    {
+        var frame = new LaserPoint[frameSize];
+        for (var index = 0; index < frame.Length; index++)
+        {
+            var sampleIndex = expected.Count;
+            frame[index] = new LaserPoint(
+                (ushort)(sampleIndex & 0x0fff),
+                (ushort)((sampleIndex * 3) & 0x0fff),
+                (ushort)((sampleIndex * 5) & 0x0fff),
+                (ushort)((sampleIndex * 7) & 0x0fff),
+                (ushort)((sampleIndex * 11) & 0x0fff));
+            expected.Add(frame[index]);
+        }
+
+        queue.Enqueue(frame);
+    }
+
+    var packets = new List<byte[]>();
+    while (queue.Count > 0)
+    {
+        while (queue.PacketsInBurst < LaserCubeProtocol.MaximumPacketsPerBurst &&
+               queue.TryCreatePacket(flushPartial: true, out var packet, out _))
+        {
+            packets.Add(packet!);
+        }
+
+        True(queue.PacketsInBurst <= LaserCubeProtocol.MaximumPacketsPerBurst);
+        queue.CompleteBurst();
+    }
+
+    var actual = new List<LaserPoint>(expected.Count);
+    for (var packetIndex = 0; packetIndex < packets.Count; packetIndex++)
+    {
+        var packet = packets[packetIndex];
+        var packetSampleCount = (packet.Length - LaserCubeProtocol.DataHeaderSize) / LaserCubeProtocol.PointSize;
+
+        if (packetIndex < packets.Count - 1)
+        {
+            Equal(LaserCubeProtocol.MaximumPointsPerPacket, packetSampleCount);
+        }
+
+        Equal(unchecked((byte)packetIndex), packet[2]);
+        Equal(unchecked((byte)(packetIndex / LaserCubeProtocol.MaximumPacketsPerBurst)), packet[3]);
+
+        for (var index = 0; index < packetSampleCount; index++)
+        {
+            var pointBytes = packet.AsSpan(
+                LaserCubeProtocol.DataHeaderSize + (index * LaserCubeProtocol.PointSize),
+                LaserCubeProtocol.PointSize);
+            actual.Add(new LaserPoint(
+                BinaryPrimitives.ReadUInt16LittleEndian(pointBytes[0..2]),
+                BinaryPrimitives.ReadUInt16LittleEndian(pointBytes[2..4]),
+                BinaryPrimitives.ReadUInt16LittleEndian(pointBytes[4..6]),
+                BinaryPrimitives.ReadUInt16LittleEndian(pointBytes[6..8]),
+                BinaryPrimitives.ReadUInt16LittleEndian(pointBytes[8..10])));
+        }
+    }
+
+    Equal(expected.Count, actual.Count);
+    for (var index = 0; index < expected.Count; index++)
+    {
+        Equal(expected[index], actual[index]);
+    }
+}
+
+static void CheckDataSenderBurstPacing() =>
+    CheckDataSenderBurstPacingAsync().GetAwaiter().GetResult();
+
+static async Task CheckDataSenderBurstPacingAsync()
+{
+    var samples = Enumerable
+        .Repeat(new LaserPoint(1, 2, 3, 4, 5),
+            (LaserCubeProtocol.MaximumPacketsPerBurst * 2 + 1) * LaserCubeProtocol.MaximumPointsPerPacket)
+        .ToArray();
+    var packets = new List<byte[]>();
+    var sentSamples = 0;
+    var droppedSamples = 0;
+    Exception? fault = null;
+    var completed = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    await using var sender = new LaserCubeDataSender(
+        (packet, _) =>
+        {
+            packets.Add(packet.ToArray());
+            return ValueTask.CompletedTask;
+        },
+        () => 30_000,
+        count =>
+        {
+            sentSamples += count;
+            if (sentSamples == samples.Length)
+            {
+                completed.TrySetResult(true);
+            }
+        },
+        count => droppedSamples += count,
+        exception =>
+        {
+            fault = exception;
+            completed.TrySetException(exception);
+        });
+
+    True(sender.TryEnqueue(samples));
+    await completed.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+    Equal(samples.Length, sentSamples);
+    Equal(0, droppedSamples);
+    Equal<Exception?>(null, fault);
+    Equal(LaserCubeProtocol.MaximumPacketsPerBurst * 2 + 1, packets.Count);
+
+    for (var index = 0; index < packets.Count; index++)
+    {
+        Equal(unchecked((byte)index), packets[index][2]);
+        Equal(unchecked((byte)(index / LaserCubeProtocol.MaximumPacketsPerBurst)), packets[index][3]);
+    }
 }
 
 static void CheckBufferResponseParsing()
